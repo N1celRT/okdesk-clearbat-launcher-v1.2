@@ -87,6 +87,7 @@
   let issueScanTimer = null;
   let lastIssueUrl = '';
   const entityCache = new Map();
+  const equipmentButtonUrls = new WeakMap();
   const issueState = {
     key: '',
     signature: '',
@@ -267,11 +268,7 @@
     button.addEventListener('click', function (event) {
       event.preventDefault();
       event.stopPropagation();
-      if (!button.dataset.clearbatUrl) {
-        return;
-      }
-
-      launchClearbatUrl(button.dataset.clearbatUrl);
+      launchClearbatUrl(equipmentButtonUrls.get(button));
     });
 
     return button;
@@ -285,7 +282,7 @@
     button.dataset.isReady = options.isReady ? 'true' : 'false';
     button.style.cursor = options.isReady ? 'pointer' : 'default';
     applyLaunchButtonInteractiveState(button, false);
-    setClearbatUrl(button, options.clearbatUrl);
+    equipmentButtonUrls.set(button, options.clearbatUrl);
 
     let icon = button.querySelector('img');
     if (!icon) {
@@ -341,14 +338,6 @@
     ].join(';');
 
     return infoButton;
-  }
-
-  function setClearbatUrl(button, clearbatUrl) {
-    if (button.dataset.clearbatUrl === clearbatUrl) {
-      return;
-    }
-
-    button.dataset.clearbatUrl = clearbatUrl;
   }
 
   function getTerminalInvalidMessage(accessButton) {
@@ -440,13 +429,18 @@
     return String(value || '').replace(/\s+/g, ' ').trim();
   }
 
-  function findFieldLabel(kind) {
-    const aliases = LABEL_ALIASES[kind];
-    if (!aliases) {
-      return null;
-    }
-
-    const labelSelectors = [
+  // Подпись и значение ищем только в полях заявки.
+  const excludedIssueContent = [
+    `#${PANEL_ID}`, '[class*="comment" i]', '[data-role*="comment" i]',
+    '[class*="description" i]', '[data-role*="description" i]', '[contenteditable="true"]',
+    '.trix-content', '.redactor-styles', 'blockquote'
+  ].join(',');
+  const fieldRowSelector = [
+    'tr', '.field', '.form-group', '.b-field', '.issue-field', '.b-issue-field',
+    '.attribute', '.b-attribute', '[class*="field-row"]', '[class*="field_row"]',
+    '[class*="attribute-row"]', '[data-role="issue-field"]'
+  ].join(',');
+  const fieldLabelSelector = [
       'dt',
       'label',
       '.field-label',
@@ -468,8 +462,10 @@
       '[class*="attribute-title"]',
       '[class*="param-label"]',
       '[class*="param__label"]'
-    ];
+  ].join(',');
 
+  function findFieldLabel(kind) {
+    const aliases = LABEL_ALIASES[kind];
     const roots = [
       document.querySelector('main'),
       document.querySelector('.b-content'),
@@ -484,24 +480,30 @@
       }
 
       seenRoots.add(root);
-      const found = findLabelInElements(root.querySelectorAll(labelSelectors.join(',')), aliases);
+      const found = findLabelInElements(root.querySelectorAll(fieldLabelSelector), aliases);
       if (found) {
         return found;
       }
     }
 
-    const foundInDocument = findLabelInElements(document.querySelectorAll(labelSelectors.join(',')), aliases);
+    const foundInDocument = findLabelInElements(document.querySelectorAll(fieldLabelSelector), aliases);
     if (foundInDocument) {
       return foundInDocument;
     }
 
-    return findLabelInElements(document.querySelectorAll('span, div, th'), aliases);
+    const rows = document.querySelectorAll(fieldRowSelector);
+    for (const row of rows) {
+      const label = findLabelInElements(row.querySelectorAll(':scope > span, :scope > div'), aliases);
+      if (label) {
+        return label;
+      }
+    }
+    return null;
   }
 
   function findLabelInElements(elements, aliases) {
-    let fallback = null;
     for (const element of elements) {
-      if (isInsideChrome(element) || element.closest('a, button')) {
+      if (isInsideChrome(element) || element.closest(excludedIssueContent) || element.closest('a, button')) {
         continue;
       }
 
@@ -510,18 +512,13 @@
         continue;
       }
 
-      for (const alias of aliases) {
-        if (text === alias) {
-          return element;
-        }
-
-        if (!fallback && text.startsWith(alias) && text.length <= alias.length + 18) {
-          fallback = element;
-        }
+      const label = text.replace(/\s*\d+$/, '').trim();
+      if (aliases.includes(label)) {
+        return element;
       }
     }
 
-    return fallback;
+    return null;
   }
 
   function findFieldContainer(labelElement) {
@@ -529,56 +526,30 @@
       return null;
     }
 
-    const containerSelectors = [
-      'tr',
-      '.field',
-      '.form-group',
-      '.b-field',
-      '.issue-field',
-      '.b-issue-field',
-      '.attribute',
-      '.b-attribute',
-      '.custom-parameters-list',
-      '[class*="field-row"]',
-      '[class*="field_row"]',
-      '[class*="field-group"]',
-      '[class*="field_group"]',
-      '[class*="field-body"]',
-      '[class*="attribute-row"]',
-      'dl',
-      'li'
-    ];
-
-    let current = labelElement;
-    for (let depth = 0; current && depth < 7; depth += 1) {
-      if (current.matches && current.matches(containerSelectors.join(','))) {
-        if (current !== labelElement && !current.matches('tr, dl') && countFieldLabels(current) > 1) {
-          return current.parentElement || current;
-        }
-
-        return current;
-      }
-
-      if (current !== labelElement && countFieldLabels(current) > 1) {
-        return current.parentElement || current;
-      }
-
-      current = current.parentElement;
+    if (labelElement.matches('dt, th')) {
+      const value = labelElement.nextElementSibling;
+      const valueTag = labelElement.matches('dt') ? 'dd' : 'td';
+      return value && value.matches(valueTag) ? value : null;
     }
 
-    return labelElement.parentElement;
-  }
-
-  function countFieldLabels(element) {
-    const text = normalizeLabel(element.textContent).slice(0, 120);
-    let count = 0;
-    for (const aliases of Object.values(LABEL_ALIASES)) {
-      if (aliases.some(function (alias) { return text.includes(alias); })) {
-        count += 1;
+    const row = labelElement.closest(fieldRowSelector);
+    if (row) {
+      // Общая строка с несколькими полями не определяет принадлежность ссылок.
+      const labels = row.querySelectorAll(fieldLabelSelector);
+      if (Array.from(labels).some(function (other) {
+        return other !== labelElement && !other.contains(labelElement) && !labelElement.contains(other);
+      })) {
+        return null;
       }
+      return row;
     }
 
-    return count;
+    const sibling = labelElement.nextElementSibling;
+    return sibling && !sibling.closest(excludedIssueContent)
+      && sibling.matches('dd, td, a[href], [data-role*="value"], [class*="value"], [data-equipment-id], [data-company-id], [data-object-id]')
+      && !sibling.matches(fieldLabelSelector)
+      && !sibling.querySelector(fieldLabelSelector)
+      && !sibling.matches(fieldRowSelector) ? sibling : null;
   }
 
   function isActionLink(anchor) {
@@ -630,7 +601,7 @@
   function isEquipmentCardUrl(urlValue) {
     try {
       const url = new URL(urlValue, window.location.href);
-      return /^\/(?:equipments?|devices?)\/\d+\/?$/.test(url.pathname);
+      return /^\/(?:equipments?|devices?|inventory|inventories)\/\d+\/?$/i.test(url.pathname);
     } catch {
       return false;
     }
@@ -643,14 +614,19 @@
 
     const links = [];
     const seen = new Set();
-    for (const anchor of container.querySelectorAll('a[href]')) {
+    const anchors = container.matches('a[href]') ? [container] : container.querySelectorAll('a[href]');
+    for (const anchor of anchors) {
+      if (anchor.closest(excludedIssueContent)) {
+        continue;
+      }
       const url = toAbsoluteUrl(anchor.getAttribute('href'));
       if (!url || !isEquipmentCardUrl(url) || seen.has(url)) {
         continue;
       }
 
       const text = cleanEquipmentName(anchor.textContent);
-      if (!text || text.length > 260 || /информац|справк|подробн|help|support/i.test(text)) {
+      if (!text || text.length > 260 || /информац|справк|подробн|help|support/i.test(text)
+        || /^(просмотр|открыть|перейти|view|open|info)$/i.test(text)) {
         continue;
       }
 
@@ -661,43 +637,21 @@
     return links;
   }
 
-  function collectLinks(container, kind, labelElement) {
-    const sibling = labelElement ? labelElement.nextElementSibling : null;
-    const valueContainer = sibling && !sibling.matches('dt, label, .field-label, .b-issue-field__label')
-      ? sibling
-      : null;
-
-    if (kind === 'equipment') {
-      const scope = container || valueContainer;
-      const cardLinks = collectEquipmentAnchorLinks(scope);
-      if (cardLinks.length) {
-        return rankEntityLinks(cardLinks, kind);
-      }
-
-      const rowLinks = collectEquipmentRowLinks(scope);
-      const anchorLinks = collectLinksFromContainer(scope, kind);
-      const merged = [];
-      const seen = new Set();
-      for (const link of [...rowLinks, ...anchorLinks]) {
-        if (!link.url || seen.has(link.url)) {
-          continue;
-        }
-
-        seen.add(link.url);
-        merged.push(link);
-      }
-
-      return rankEntityLinks(merged, kind);
+  function collectLinks(container, kind) {
+    if (kind !== 'equipment') {
+      return collectLinksFromContainer(container, kind);
     }
 
-    if (valueContainer) {
-      const siblingLinks = collectLinksFromContainer(valueContainer, kind);
-      if (siblingLinks.length) {
-        return siblingLinks;
+    const anchors = collectEquipmentAnchorLinks(container);
+    const rows = collectEquipmentRowLinks(container);
+    const cards = new Map();
+    for (const link of [...anchors, ...rows]) {
+      const id = new URL(link.url).pathname.match(/\/(\d+)\/?$/)[1];
+      if (!cards.has(id)) {
+        cards.set(id, link);
       }
     }
-
-    return collectLinksFromContainer(container, kind);
+    return Array.from(cards.values());
   }
 
   function cleanEquipmentName(value) {
@@ -715,6 +669,9 @@
 
     anchors.push(...element.querySelectorAll('a[href]'));
     for (const anchor of anchors) {
+      if (anchor.closest(excludedIssueContent)) {
+        continue;
+      }
       const href = anchor.getAttribute('href') || '';
       if (!href || href === '#' || /^javascript:/i.test(href)) {
         continue;
@@ -730,6 +687,9 @@
 
     const dataElements = [element, ...element.querySelectorAll('[data-url], [data-href], [data-path], [data-equipment-id], [onclick]')];
     for (const dataElement of dataElements) {
+      if (dataElement.closest(excludedIssueContent)) {
+        continue;
+      }
       const dataUrl = dataElement.getAttribute('data-url')
         || dataElement.getAttribute('data-href')
         || dataElement.getAttribute('data-path');
@@ -763,7 +723,7 @@
       return [];
     }
 
-    const candidates = new Set();
+    const candidates = new Set([container]);
     for (const child of container.children) {
       candidates.add(child);
       for (const grandchild of child.children) {
@@ -825,15 +785,12 @@
       return [];
     }
 
-    const anchors = Array.from(container.querySelectorAll('a[href]'));
-    if (!anchors.length && container.nextElementSibling) {
-      anchors.push(...Array.from(container.nextElementSibling.querySelectorAll('a[href]')));
-    }
+    const anchors = container.matches('a[href]') ? [container] : container.querySelectorAll('a[href]');
 
     const links = [];
     const seen = new Set();
     for (const anchor of anchors) {
-      if (isActionLink(anchor)) {
+      if (anchor.closest(excludedIssueContent) || isActionLink(anchor)) {
         continue;
       }
 
@@ -855,24 +812,17 @@
         continue;
       }
 
-      if (kind === 'equipment' && !/equipment|inventory|device/i.test(url)) {
-        continue;
-      }
-
       seen.add(url);
       links.push({ url, text });
     }
 
     // Некоторые интерфейсы не дают ссылку на карточку, но хранят её в data-url.
-    const dataElements = [
-      ...Array.from(container.querySelectorAll('[data-url], [data-href], [data-path], [data-equipment-id], [data-company-id], [data-object-id]')),
-      ...(container.nextElementSibling
-        ? Array.from(container.nextElementSibling.querySelectorAll('[data-url], [data-href], [data-path], [data-equipment-id], [data-company-id], [data-object-id]'))
-        : [])
-    ];
+    const dataSelector = '[data-url], [data-href], [data-path], [data-company-id], [data-object-id]';
+    const dataElements = container.matches(dataSelector) ? [container, ...container.querySelectorAll(dataSelector)]
+      : container.querySelectorAll(dataSelector);
 
     for (const element of dataElements) {
-      if (element.closest('button') || isInsideChrome(element)) {
+      if (element.closest('button') || element.closest(excludedIssueContent) || isInsideChrome(element)) {
         continue;
       }
 
@@ -883,57 +833,31 @@
 
       let url = element.getAttribute('data-url') || element.getAttribute('data-href') || element.getAttribute('data-path');
       if (!url) {
-        const idAttribute = kind === 'equipment' ? 'data-equipment-id'
-          : (kind === 'client' ? 'data-company-id' : 'data-object-id');
+        const idAttribute = kind === 'client' ? 'data-company-id' : 'data-object-id';
         const id = element.getAttribute(idAttribute);
         url = buildCandidateEntityUrl(kind, id);
       }
 
       const absoluteUrl = url ? toAbsoluteUrl(url) : '';
       const text = normalizeWhitespace(element.textContent);
-      if (absoluteUrl && text && !seen.has(absoluteUrl)) {
+      const cardPath = absoluteUrl && new URL(absoluteUrl).pathname;
+      const expectedPath = kind === 'client' ? /compan|client|contragent/i : /object|maintenance|entity|address/i;
+      if (cardPath && expectedPath.test(cardPath) && text && !seen.has(absoluteUrl)) {
         seen.add(absoluteUrl);
         links.push({ url: absoluteUrl, text });
       }
     }
 
-    return rankEntityLinks(links, kind);
+    return rankEntityLinks(links);
   }
 
-  function rankEntityLinks(links, kind) {
-    const filtered = links.filter(function (link) {
-      if (kind === 'equipment') {
-        if (/информац|справк|подробн|help|support/i.test(link.text)) {
-          return false;
-        }
-
-        if (/^(просмотр|открыть|перейти|подробнее|view|open|info)$/i.test(link.text.trim())) {
-          return false;
-        }
-
-        try {
-          const url = new URL(link.url);
-          if (/^\/equipments?\/?$/i.test(url.pathname)) {
-            return false;
-          }
-        } catch {
-          return false;
-        }
-      }
-
-      return true;
-    });
-
-    const scored = filtered.map(function (link) {
+  function rankEntityLinks(links) {
+    const scored = links.map(function (link) {
       let score = 0;
       try {
         const url = new URL(link.url);
         if (/\/\d+(?:[/?#]|$)/.test(url.pathname)) {
           score += 10;
-        }
-
-        if (kind === 'equipment' && /\/equipments?\/\d+/i.test(url.pathname)) {
-          score += 15;
         }
 
         if (/search|filter|query|lookup/i.test(`${url.pathname}${url.search}`)) {
@@ -954,61 +878,7 @@
       return right.score - left.score;
     });
 
-    if (kind !== 'equipment') {
-      return scored.slice(0, 1);
-    }
-
-    const byName = new Map();
-    for (const link of scored) {
-      const key = normalizeWhitespace(link.text).toLowerCase();
-      if (!byName.has(key)) {
-        byName.set(key, link);
-      }
-    }
-
-    return Array.from(byName.values());
-  }
-
-  function findFallbackEntityLinks(kind) {
-    const patterns = {
-      client: /^\/companies\/\d+\/?$/i,
-      object: /^\/(?:objects|maintenance_entities|maintenance-entities)\/\d+\/?$/i,
-      equipment: /^\/(?:equipments?|devices?)\/\d+\/?$/i
-    };
-    const pattern = patterns[kind];
-    if (!pattern) {
-      return [];
-    }
-
-    const links = [];
-    const seen = new Set();
-    for (const anchor of document.querySelectorAll('a[href]')) {
-      if (isInsideChrome(anchor)) {
-        continue;
-      }
-
-      let pathname = '';
-      try {
-        pathname = new URL(anchor.getAttribute('href'), window.location.href).pathname;
-      } catch {
-        continue;
-      }
-
-      if (!pattern.test(pathname)) {
-        continue;
-      }
-
-      const url = toAbsoluteUrl(anchor.getAttribute('href'));
-      const text = cleanEquipmentName(anchor.textContent);
-      if (!url || !text || seen.has(url) || /информац|справк|подробн/i.test(text)) {
-        continue;
-      }
-
-      seen.add(url);
-      links.push({ url, text });
-    }
-
-    return rankEntityLinks(links, kind);
+    return scored.slice(0, 1);
   }
 
   function extractIssueContext() {
@@ -1016,24 +886,7 @@
     for (const kind of Object.keys(LABEL_ALIASES)) {
       const labelElement = findFieldLabel(kind);
       const container = findFieldContainer(labelElement);
-      let links = collectLinks(container, kind, labelElement);
-      if (!links.length) {
-        links = findFallbackEntityLinks(kind);
-      }
-
-      let text = '';
-      if (container) {
-        text = normalizeWhitespace(container.textContent);
-      } else if (labelElement) {
-        text = normalizeWhitespace(labelElement.parentElement ? labelElement.parentElement.textContent : '');
-      }
-
-      fields[kind] = {
-        labelElement,
-        container,
-        links,
-        text
-      };
+      fields[kind] = { labelElement, container, links: collectLinks(container, kind) };
     }
 
     const clientName = fields.client.links.length ? fields.client.links[0].text : '';
@@ -1300,14 +1153,7 @@
       showLaunchStatus(displayName);
     }
 
-    const link = document.createElement('a');
-    link.href = clearbatUrl;
-    link.style.display = 'none';
-    document.body.appendChild(link);
-    link.click();
-    window.setTimeout(function () {
-      link.remove();
-    }, 1000);
+    window.location.assign(clearbatUrl);
   }
 
   function launchBrowserUrl(url, displayName) {
@@ -1872,9 +1718,8 @@
     });
   }
 
-  function finalizeSources(sources, context) {
+  function finalizeSources(sources) {
     const ordered = orderSources(sources);
-    const equipmentSources = ordered.filter(function (source) { return source.kind === 'equipment'; });
     const objectSource = ordered.find(function (source) { return source.kind === 'object'; });
     const clientSource = ordered.find(function (source) { return source.kind === 'client'; });
 
@@ -1921,32 +1766,7 @@
       source.access = makeAccessUrls(source.rawAccess, fallback, sharedCredentials);
     }
 
-    const equipmentByName = new Map();
-    for (const source of equipmentSources) {
-      equipmentByName.set(source.name, source);
-    }
-
-    // Добавляем оборудование, для которого не нашлось ссылки, чтобы пользователь видел,
-    // что доступы не прочитаны, а не думал, что оборудование пропало.
-    for (const link of context.fields.equipment.links.slice(0, MAX_EQUIPMENT_TO_FETCH)) {
-      if (!equipmentByName.has(link.text)) {
-        const missingSource = {
-          kind: 'equipment',
-          name: link.text,
-          url: link.url,
-          params: new Map(),
-          labels: new Map(),
-          rawAccess: buildAccessFromParameters(new Map(), new Map()),
-          access: makeAccessUrls({ credentials: {}, iikoOfficeServer: null, iikoChainServer: null, iikoWebRaw: '', anydeskRaw: '', assistantRaw: '', rustdeskRaw: '' }, {}, sharedCredentials),
-          order: context.fields.equipment.links.indexOf(link),
-          error: 'Карточка не прочитана'
-        };
-        ordered.push(missingSource);
-        equipmentByName.set(link.text, missingSource);
-      }
-    }
-
-    return orderSources(ordered);
+    return ordered;
   }
 
   // ---------------------------------------------------------------------------
@@ -2222,101 +2042,28 @@
     }
   }
 
-  function describeDiagnosticElement(element) {
-    if (!element) {
-      return null;
-    }
-
-    return {
-      tag: element.tagName ? element.tagName.toLowerCase() : '',
-      id: element.id || '',
-      className: typeof element.className === 'string' ? element.className : '',
-      text: normalizeWhitespace(element.textContent).slice(0, 160)
-    };
-  }
-
-  function getDiagnosticParentChain(element, depth) {
-    const chain = [];
-    let current = element;
-    for (let index = 0; current && index < depth; index += 1) {
-      chain.push(describeDiagnosticElement(current));
-      current = current.parentElement;
-    }
-
-    return chain;
-  }
-
   function buildDiagnosticsReport() {
-    const context = issueState.context;
     const fields = {};
-    if (context && context.fields) {
-      for (const kind of Object.keys(context.fields)) {
-        const field = context.fields[kind];
-        const interactive = [];
-        if (field.container) {
-          const elements = field.container.querySelectorAll('a, button, [data-url], [data-href], [data-equipment-id], [data-company-id], [data-object-id], [onclick]');
-          for (const element of elements) {
-            if (interactive.length >= 40) {
-              break;
-            }
-
-            interactive.push({
-              tag: element.tagName ? element.tagName.toLowerCase() : '',
-              className: typeof element.className === 'string' ? element.className : '',
-              text: normalizeWhitespace(element.textContent).slice(0, 120),
-              href: element.getAttribute ? (element.getAttribute('href') || '') : '',
-              dataUrl: element.getAttribute ? (element.getAttribute('data-url') || element.getAttribute('data-href') || '') : '',
-              dataEquipmentId: element.getAttribute ? (element.getAttribute('data-equipment-id') || '') : '',
-              onclick: element.getAttribute ? (element.getAttribute('onclick') || '').slice(0, 300) : ''
-            });
-          }
-        }
-
+    const context = issueState.context;
+    if (context) {
+      for (const [kind, field] of Object.entries(context.fields)) {
         fields[kind] = {
-          label: describeDiagnosticElement(field.labelElement),
-          container: describeDiagnosticElement(field.container),
-          value: describeDiagnosticElement(field.labelElement ? field.labelElement.nextElementSibling : null),
-          links: field.links.map(function (link) { return { text: link.text, url: link.url }; }),
-          html: field.container ? field.container.outerHTML.slice(0, 5000) : '',
-          interactive
+          labelTag: field.labelElement ? field.labelElement.localName : null,
+          valueTag: field.container ? field.container.localName : null,
+          cardCount: field.links.length
         };
       }
     }
 
-    const panel = issueState.panel;
-    const rect = panel ? panel.getBoundingClientRect() : null;
-    const report = {
-      url: window.location.href,
-      viewport: { width: window.innerWidth, height: window.innerHeight },
-      panel: panel ? {
-        parentChain: getDiagnosticParentChain(panel.parentElement, 4),
-        rect: rect ? { left: Math.round(rect.left), top: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) } : null,
-        position: window.getComputedStyle(panel).position,
-        zIndex: window.getComputedStyle(panel).zIndex,
-        overflow: window.getComputedStyle(panel).overflow
-      } : null,
-      issue: context ? { id: context.id, clientName: context.clientName, objectName: context.objectName } : null,
-      fields,
-      sources: issueState.sources.map(function (source) {
-        return {
-          kind: source.kind,
-          name: source.name,
-          url: source.url,
-          error: source.error || '',
-          params: source.params ? source.params.size : 0,
-          access: source.access ? {
-            iikoOffice: Boolean(source.access.iikoOffice),
-            iikoChain: Boolean(source.access.iikoChain),
-            iikoWeb: Boolean(source.access.iikoWeb),
-            assistant: Boolean(source.access.assistant),
-            rustdesk: Boolean(source.access.rustdesk),
-            anydesk: Boolean(source.access.anydesk)
-          } : null
-        };
-      })
-    };
-
-    return JSON.stringify(report, null, 2);
+    const sources = issueState.sources.map(function (source) {
+      let errorCode = null;
+      if (source.error) {
+        const http = /^HTTP (\d{3})$/.exec(source.error);
+        errorCode = http ? `http_${http[1]}` : (source.error === 'Превышено время ожидания' ? 'timeout' : 'read_failed');
+      }
+      return { kind: source.kind, errorCode };
+    });
+    return JSON.stringify({ fields, sources }, null, 2);
   }
 
   function toggleDiagnostics(panel) {
@@ -2390,7 +2137,10 @@
         parts.push(`Объект: ${context.objectName}`);
       }
 
-      contextElement.textContent = parts.join(' · ');
+      const title = parts.join(' · ');
+      if (contextElement.textContent !== title) {
+        contextElement.textContent = title;
+      }
       contextElement.title = parts.join('\n');
     }
   }
@@ -2563,8 +2313,6 @@
     button.type = 'button';
     button.className = `okdesk-tl-tool${url ? '' : ' okdesk-tl-tool-disabled'}`;
     button.dataset.tool = tool.id;
-    button.dataset.clearbatUrl = tool.launch === 'browser' ? '' : url;
-    button.dataset.launchUrl = url;
     button.disabled = !url;
     button.title = url
       ? (tool.launch === 'browser' ? `Открыть ${tool.displayName}` : `Запустить ${tool.displayName}`)
@@ -2767,7 +2515,7 @@
         return;
       }
 
-      const sources = finalizeSources(loadedSources, context);
+      const sources = finalizeSources(loadedSources);
       issueState.sources = sources;
       issueState.loading = false;
       renderSources(sources);
@@ -2805,16 +2553,11 @@
     }
 
     lastIssueUrl = currentUrl;
+    removeIssuePanel();
     if (!isIssuePage()) {
-      removeIssuePanel();
       return;
     }
 
-    issueState.key = '';
-    issueState.signature = '';
-    issueState.sources = [];
-    issueState.lastAttemptSignature = '';
-    issueState.lastAttemptAt = 0;
     scheduleIssueScan(false);
   }
 
@@ -2823,6 +2566,8 @@
       issueState.panel.remove();
     }
 
+    issueState.requestToken += 1;
+    issueState.context = null;
     issueState.panel = null;
     issueState.body = null;
     issueState.key = '';
@@ -2843,6 +2588,9 @@
 
     let hasRelevantChanges = false;
     for (const mutation of mutations) {
+      if (issueState.panel && issueState.panel.contains(mutation.target)) {
+        continue;
+      }
       if (mutation.type === 'childList' && (mutation.addedNodes.length || mutation.removedNodes.length)) {
         hasRelevantChanges = true;
         break;

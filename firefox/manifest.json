@@ -37,7 +37,7 @@
   ],
   "browser_specific_settings": {
     "gecko": {
-      "id": "okdesk-ticket-launcher@ruffid.local",
+      "id": "okdesk-clearbat-launcher@ruffid.local",
       "strict_min_version": "109.0"
     }
   }
