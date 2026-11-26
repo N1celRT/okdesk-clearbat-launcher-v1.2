@@ -20,6 +20,7 @@
   ]);
   const MAX_EQUIPMENT_TO_FETCH = 8;
   const FETCH_TIMEOUT_MS = 15000;
+  const EMPTY_RETRY_DELAYS_MS = [1000, 3000];
 
   const ACCESS_BUTTONS = [
     { parameterCode: 'AnyDesk', clearbatType: 'anydesk', displayName: 'AnyDesk', iconFile: 'anydesk.png', requirePassword: true },
@@ -86,20 +87,18 @@
   let scanScheduled = false;
   let issueScanTimer = null;
   let lastIssueUrl = '';
-  const entityCache = new Map();
+  let entityCache = new Map();
+  let emptyRetryTimer = null;
   const equipmentButtonUrls = new WeakMap();
   const issueState = {
     key: '',
     signature: '',
     panel: null,
     body: null,
-    loading: false,
-    force: false,
     sources: [],
     context: null,
     requestToken: 0,
-    lastAttemptSignature: '',
-    lastAttemptAt: 0
+    emptyRetries: 0
   };
 
   // ---------------------------------------------------------------------------
@@ -433,7 +432,7 @@
   const excludedIssueContent = [
     `#${PANEL_ID}`, '[class*="comment" i]', '[data-role*="comment" i]',
     '[class*="description" i]', '[data-role*="description" i]', '[contenteditable="true"]',
-    '.trix-content', '.redactor-styles', 'blockquote'
+    '.trix-content', '.redactor-styles', 'blockquote', '.preview-dialog'
   ].join(',');
   const fieldRowSelector = [
     'tr', '.field', '.form-group', '.b-field', '.issue-field', '.b-issue-field',
@@ -499,6 +498,27 @@
       }
     }
     return null;
+  }
+
+  function findIssueField(kind) {
+    if (kind === 'equipment') {
+      const markers = document.querySelectorAll('[data-category="issue_card"][data-position="equipments"]');
+      for (const marker of markers) {
+        if (marker.closest(excludedIssueContent)) {
+          continue;
+        }
+
+        // Каждое привязанное устройство может занимать отдельный блок рядом с заголовком.
+        const header = marker.closest('span')?.parentElement;
+        const labelElement = header?.children[0];
+        if (labelElement && LABEL_ALIASES.equipment.includes(normalizeLabel(labelElement.textContent))) {
+          return { labelElement, container: header.parentElement };
+        }
+      }
+    }
+
+    const labelElement = findFieldLabel(kind);
+    return { labelElement, container: findFieldContainer(labelElement) };
   }
 
   function findLabelInElements(elements, aliases) {
@@ -683,6 +703,14 @@
           return url;
         }
       }
+
+      if (anchor.getAttribute('data-role') === 'preview-dialog-show-btn') {
+        const url = toAbsoluteUrl(href);
+        const preview = url && new URL(url).pathname.match(/^\/equipments\/(\d+)\/previews\/?$/);
+        if (preview) {
+          return buildCandidateEntityUrl('equipment', preview[1]);
+        }
+      }
     }
 
     const dataElements = [element, ...element.querySelectorAll('[data-url], [data-href], [data-path], [data-equipment-id], [onclick]')];
@@ -701,7 +729,8 @@
       }
 
       const equipmentId = dataElement.getAttribute('data-equipment-id');
-      if (equipmentId) {
+      // У кнопки предпросмотра этот атрибут может отличаться от ID карточки в href.
+      if (equipmentId && dataElement.getAttribute('data-role') !== 'preview-dialog-show-btn') {
         const url = buildCandidateEntityUrl('equipment', equipmentId);
         if (url) {
           return url;
@@ -884,8 +913,7 @@
   function extractIssueContext() {
     const fields = {};
     for (const kind of Object.keys(LABEL_ALIASES)) {
-      const labelElement = findFieldLabel(kind);
-      const container = findFieldContainer(labelElement);
+      const { labelElement, container } = findIssueField(kind);
       fields[kind] = { labelElement, container, links: collectLinks(container, kind) };
     }
 
@@ -1598,10 +1626,12 @@
     return Array.from(new Set(candidates));
   }
 
-  async function fetchEntity(link, kind, force) {
+  async function fetchEntity(link, kind) {
+    // Незавершённое чтение пишет только в кэш той заявки, где оно началось.
+    const cache = entityCache;
     const cacheKey = `${kind}:${link.url}`;
-    if (!force && entityCache.has(cacheKey)) {
-      return entityCache.get(cacheKey);
+    if (cache.has(cacheKey)) {
+      return cache.get(cacheKey);
     }
 
     const candidates = buildEntityUrlCandidates(link, kind);
@@ -1613,7 +1643,9 @@
         const payload = await fetchTextWithTimeout(url);
         const source = parseEntityPayload(payload, kind, link.text, url);
         if (hasRawAccess(source.rawAccess) || source.params.size) {
-          entityCache.set(cacheKey, source);
+          if (hasRawAccess(source.rawAccess)) {
+            cache.set(cacheKey, source);
+          }
           return source;
         }
 
@@ -1628,7 +1660,6 @@
     }
 
     if (bestSource) {
-      entityCache.set(cacheKey, bestSource);
       return bestSource;
     }
 
@@ -1641,23 +1672,22 @@
       rawAccess: buildAccessFromParameters(new Map(), new Map()),
       error: lastError || 'Не удалось прочитать карточку'
     };
-    entityCache.set(cacheKey, source);
     return source;
   }
 
-  async function loadIssueSources(context, force) {
+  async function loadIssueSources(context, local, localRawAccess) {
     const sources = [];
     const requests = [];
 
     if (context.fields.client.links.length) {
-      requests.push(fetchEntity(context.fields.client.links[0], 'client', force).then(function (source) {
+      requests.push(fetchEntity(context.fields.client.links[0], 'client').then(function (source) {
         source.order = 20;
         sources.push(source);
       }));
     }
 
     if (context.fields.object.links.length) {
-      requests.push(fetchEntity(context.fields.object.links[0], 'object', force).then(function (source) {
+      requests.push(fetchEntity(context.fields.object.links[0], 'object').then(function (source) {
         source.order = 10;
         sources.push(source);
       }));
@@ -1665,14 +1695,12 @@
 
     const equipmentLinks = context.fields.equipment.links.slice(0, MAX_EQUIPMENT_TO_FETCH);
     equipmentLinks.forEach(function (link, index) {
-      requests.push(fetchEntity(link, 'equipment', force).then(function (source) {
+      requests.push(fetchEntity(link, 'equipment').then(function (source) {
         source.order = index;
         sources.push(source);
       }));
     });
 
-    const local = parseParameterDocument(document);
-    const localRawAccess = buildAccessFromParameters(local.params, local.labels);
     if (local.params.size || hasRawAccess(localRawAccess)) {
       sources.push({
         kind: 'issue',
@@ -1839,9 +1867,7 @@
     refreshButton.addEventListener('click', function (event) {
       event.preventDefault();
       event.stopPropagation();
-      issueState.lastAttemptSignature = '';
-      issueState.lastAttemptAt = 0;
-      entityCache.clear();
+      issueState.emptyRetries = 0;
       refreshIssuePanel(true);
     });
 
@@ -2421,19 +2447,17 @@
     return row;
   }
 
+  function isVisibleSource(source) {
+    return source.kind === 'equipment' || hasAnyAccess(source);
+  }
+
   function renderSources(sources) {
     if (!issueState.body) {
       return;
     }
 
     issueState.body.textContent = '';
-    const rows = sources.filter(function (source) {
-      if (source.kind === 'equipment') {
-        return true;
-      }
-
-      return hasAnyAccess(source);
-    });
+    const rows = sources.filter(isVisibleSource);
 
     if (!rows.length) {
       renderError('Доступы не найдены. Проверьте, что в карточке оборудования заполнены AnyDesk, RustDesk, Ассистент, iikoWeb, Адрес сервера и Iiko логин/пароль.');
@@ -2480,69 +2504,71 @@
     issueState.context = context;
     ensurePanel(context);
 
+    const local = parseParameterDocument(document);
+    const localRawAccess = buildAccessFromParameters(local.params, local.labels);
     const signature = JSON.stringify({
+      localRawAccess,
       client: context.fields.client.links.map(function (link) { return link.url; }),
       object: context.fields.object.links.map(function (link) { return link.url; }),
       equipment: context.fields.equipment.links.map(function (link) { return link.url; })
     });
 
     const key = context.id || window.location.pathname;
-    if (!force && issueState.key === key && issueState.signature === signature && issueState.sources.length) {
+    const sameContext = issueState.key === key && issueState.signature === signature;
+    if (!force && sameContext) {
       return;
     }
 
-    if (!force && issueState.loading && issueState.key === key && issueState.signature === signature) {
-      return;
+    window.clearTimeout(emptyRetryTimer);
+    if (force || issueState.key !== key) {
+      entityCache = new Map();
     }
-
-    if (!force && issueState.lastAttemptSignature === signature
-      && Date.now() - issueState.lastAttemptAt < 5000) {
-      return;
+    if (!sameContext) {
+      issueState.emptyRetries = 0;
     }
 
     issueState.key = key;
     issueState.signature = signature;
-    issueState.lastAttemptSignature = signature;
-    issueState.lastAttemptAt = Date.now();
-    issueState.loading = true;
     const token = issueState.requestToken + 1;
     issueState.requestToken = token;
     renderLoading();
 
     try {
-      const loadedSources = await loadIssueSources(context, Boolean(force));
+      const loadedSources = await loadIssueSources(context, local, localRawAccess);
       if (token !== issueState.requestToken) {
         return;
       }
 
       const sources = finalizeSources(loadedSources);
       issueState.sources = sources;
-      issueState.loading = false;
+      if (!sources.some(isVisibleSource)
+        && issueState.emptyRetries < EMPTY_RETRY_DELAYS_MS.length) {
+        const delay = EMPTY_RETRY_DELAYS_MS[issueState.emptyRetries++];
+        emptyRetryTimer = window.setTimeout(function () {
+          if (token === issueState.requestToken) {
+            refreshIssuePanel(true);
+          }
+        }, delay);
+        return;
+      }
       renderSources(sources);
     } catch (error) {
       if (token !== issueState.requestToken) {
         return;
       }
 
-      issueState.loading = false;
       renderError(`Ошибка чтения карточек: ${error && error.message ? error.message : error}`);
     }
   }
 
-  function scheduleIssueScan(force) {
-    if (issueScanTimer) {
-      window.clearTimeout(issueScanTimer);
-    }
-
-    if (force) {
-      issueState.force = true;
+  function scheduleIssueScan() {
+    if (issueScanTimer !== null) {
+      return;
     }
 
     issueScanTimer = window.setTimeout(function () {
       issueScanTimer = null;
-      const forceNow = issueState.force;
-      issueState.force = false;
-      refreshIssuePanel(forceNow);
+      refreshIssuePanel(false);
     }, 250);
   }
 
@@ -2558,10 +2584,14 @@
       return;
     }
 
-    scheduleIssueScan(false);
+    scheduleIssueScan();
   }
 
   function removeIssuePanel() {
+    window.clearTimeout(emptyRetryTimer);
+    window.clearTimeout(issueScanTimer);
+    issueScanTimer = null;
+    entityCache = new Map();
     if (issueState.panel) {
       issueState.panel.remove();
     }
@@ -2573,9 +2603,7 @@
     issueState.key = '';
     issueState.signature = '';
     issueState.sources = [];
-    issueState.loading = false;
-    issueState.lastAttemptSignature = '';
-    issueState.lastAttemptAt = 0;
+    issueState.emptyRetries = 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -2591,7 +2619,8 @@
       if (issueState.panel && issueState.panel.contains(mutation.target)) {
         continue;
       }
-      if (mutation.type === 'childList' && (mutation.addedNodes.length || mutation.removedNodes.length)) {
+      if (mutation.type === 'attributes' || mutation.type === 'characterData'
+        || (mutation.type === 'childList' && (mutation.addedNodes.length || mutation.removedNodes.length))) {
         hasRelevantChanges = true;
         break;
       }
@@ -2600,13 +2629,17 @@
     if (hasRelevantChanges) {
       scheduleScanAccessParameters();
       if (isIssuePage()) {
-        scheduleIssueScan(false);
+        scheduleIssueScan();
       }
     }
   });
 
   observer.observe(document.documentElement, {
     childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['href', 'data-url', 'data-href', 'data-path', 'data-equipment-id', 'data-company-id',
+      'data-object-id', 'onclick', 'data-role', 'data-category', 'data-position', 'data-parameter-code', 'data-code', 'data-value'],
     subtree: true
   });
 
@@ -2617,7 +2650,7 @@
 
   lastIssueUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
   if (isIssuePage()) {
-    scheduleIssueScan(false);
+    scheduleIssueScan();
   }
 
   window.setInterval(handlePossibleNavigation, 1500);
